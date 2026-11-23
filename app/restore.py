@@ -2,14 +2,26 @@
 
 Guarantees
 ----------
-* The archive is read sequentially in streaming mode (``r|gz``); no seeking is
-  required, which keeps it usable on read-only mounts and pipes.
+* The archive file is opened exactly once per request.  Both passes read from
+  that same open file description, so an atomic rotation of the path between
+  the passes cannot mix bytes from the old and the new backup: a request that
+  opened the old file finishes from the old file, while a request that starts
+  after the rotation uses the new one.
+* Decompression is done in chunks by :class:`_ValidatedGzipReader`, which uses
+  :class:`gzip.GzipFile` underneath and therefore verifies the CRC32 *and*
+  ISIZE trailer of **every** gzip member.  Concatenated (multi-member) gzip
+  streams are fully supported.
+* The entire gzip stream is validated before anything is published, even when
+  the selected directory appeared early in the archive.  A truncated tail or a
+  bad member checksum fails the restore and removes this attempt's staging
+  area.
 * Only the selected subtree is materialised.  Bytes of members that are not
   needed are read in chunks and discarded, never written.
 * The total number of *extracted* payload bytes is at most twice the payload of
-  one complete decompression.  There is exactly one full scan (1x); a second
-  scan happens only when a retained hard link points at a regular file outside
-  the selection, and it stops as soon as those targets have been read (<= 1x).
+  one complete decompression.  There is exactly one full scan (1x), including
+  the gzip tail; a second scan happens only when a retained hard link points at
+  a regular file outside the selection, and it stops as soon as those targets
+  have been read (<= 1x).
 * A hard link whose target lies outside the selection, appears later in the
   archive, or is itself a hard link (chained) is resolved against the archive
   root.  All retained entries that resolve to the same regular-file member are
@@ -23,6 +35,7 @@ Guarantees
 
 from __future__ import annotations
 
+import gzip
 import logging
 import os
 import shutil
@@ -90,6 +103,9 @@ class RestoreResult:
     hardlinks: int = 0
     bytes_written: int = 0
     bytes_extracted: int = 0
+    # Every byte produced by the gzip decoder, across all passes, including
+    # members that were skipped and the tail that only existed to be checked.
+    bytes_decompressed: int = 0
     archive_payload_bytes: int = 0
     skipped_unsafe: int = 0
     skipped_unsupported: int = 0
@@ -154,11 +170,75 @@ def _member_kind(info: tarfile.TarInfo) -> str:
     return OTHER
 
 
-def _open_stream(path: str) -> tarfile.TarFile:
+def _open_stream(
+    fileobj: BinaryIO, stats: Optional[RestoreResult] = None
+) -> tuple[tarfile.TarFile, "_ValidatedGzipReader"]:
+    """Open a tar stream over ``fileobj`` and validate gzip down to the last bit.
+
+    ``fileobj`` is already open on the backup, so the same file description is
+    used for every pass.  ``tarfile`` is fed *decompressed* bytes (``r|``); all
+    gzip framing, CRC32 and ISIZE checks are performed by the reader below.
+    """
+
     try:
-        return tarfile.open(path, mode="r|gz")
-    except (tarfile.TarError, OSError) as exc:
-        raise InvalidArchive(f"cannot open archive {path!r}: {exc}") from exc
+        fileobj.seek(0)
+    except (OSError, ValueError) as exc:
+        raise InvalidArchive(f"cannot rewind archive: {exc}") from exc
+    reader = _ValidatedGzipReader(fileobj, stats)
+    try:
+        stream = tarfile.open(fileobj=reader, mode="r|")
+    except (tarfile.TarError, EOFError, zlib.error, OSError, InvalidArchive) as exc:
+        reader.close()
+        if isinstance(exc, InvalidArchive):
+            raise
+        raise InvalidArchive(f"cannot open archive: {exc}") from exc
+    return stream, reader
+
+
+class _ValidatedGzipReader:
+    """Read a (possibly multi-member) gzip stream and verify every member.
+
+    ``gzip.GzipFile`` validates the CRC32 and ISIZE trailer of each member as
+    its end is reached and transparently continues with the next member.
+    Reading until it returns ``b""`` is therefore what proves the *whole*
+    stream is intact; :meth:`finish` does exactly that for the caller.
+    """
+
+    def __init__(
+        self, fileobj: BinaryIO, stats: Optional[RestoreResult] = None
+    ) -> None:
+        self.stats = stats
+        self.decompressed = 0
+        try:
+            self._gz = gzip.GzipFile(fileobj=fileobj, mode="rb")
+        except (OSError, EOFError, zlib.error) as exc:
+            raise InvalidArchive(f"not a valid gzip stream: {exc}") from exc
+
+    def read(self, size: int = -1) -> bytes:
+        try:
+            chunk = self._gz.read(size)
+        except gzip.BadGzipFile as exc:
+            # CRC32 or ISIZE mismatch in some member's trailer.
+            raise InvalidArchive(f"gzip member check failed: {exc}") from exc
+        except (EOFError, zlib.error) as exc:
+            raise InvalidArchive(f"corrupt or truncated gzip stream: {exc}") from exc
+        self.decompressed += len(chunk)
+        if self.stats is not None:
+            self.stats.bytes_decompressed += len(chunk)
+        return chunk
+
+    def finish(self) -> None:
+        """Consume the remainder of the stream, validating its tail."""
+
+        while True:
+            if not self.read(CHUNK_SIZE):
+                return
+
+    def close(self) -> None:
+        try:
+            self._gz.close()
+        except OSError:
+            pass
 
 
 def _drain(reader: Optional[BinaryIO], stats: RestoreResult) -> None:
@@ -349,7 +429,7 @@ class _Plan:
 
 
 def _populate(
-    archive_path: str,
+    archive_file: BinaryIO,
     selection: str,
     output_root: str,
     stats: RestoreResult,
@@ -363,91 +443,99 @@ def _populate(
     selection_member: Optional[Member] = None
     has_descendants = False
 
-    stream = _open_stream(archive_path)
-    with stream:
-        for info in stream:
-            try:
-                name = normalize_member_name(info.name)
-            except MalformedArchive as exc:
-                logger.warning("skipping unsafe member: %s", exc)
-                stats.skipped_unsafe += 1
-                if info.isreg():
-                    stats.archive_payload_bytes += info.size
-                    _drain(stream.extractfile(info), stats)
-                continue
-            if not name:
-                if info.isreg():
-                    stats.archive_payload_bytes += info.size
-                    _drain(stream.extractfile(info), stats)
-                continue
-            kind = _member_kind(info)
-            if name in members:
-                existing = members[name]
-                # Duplicate directory entries occur in real archives (e.g. an
-                # explicit "dir/" plus an implicit one); treat them as one.
-                if kind == DIR and existing.kind == DIR:
-                    continue
-                raise MalformedArchive(f"duplicate archive member {name!r}")
-
-            linkname = None
-            invalid_link = None
-            if kind == HARDLINK:
+    stream, gz_reader = _open_stream(archive_file, stats)
+    try:
+        with stream:
+            for info in stream:
                 try:
-                    linkname = normalize_member_name(info.linkname or "")
-                    if not linkname:
-                        invalid_link = "empty target"
+                    name = normalize_member_name(info.name)
                 except MalformedArchive as exc:
-                    invalid_link = str(exc)
-                if invalid_link and _within(name, selection):
-                    # A link we must reproduce cannot be trusted; fail loudly.
-                    raise LinkError(f"hard link {name!r}: {invalid_link}")
-            member = Member(
-                name=name,
-                kind=kind,
-                size=info.size if kind == FILE else 0,
-                mode=info.mode,
-                mtime=info.mtime,
-                linkname=linkname,
-            )
-            members[name] = member
+                    logger.warning("skipping unsafe member: %s", exc)
+                    stats.skipped_unsafe += 1
+                    if info.isreg():
+                        stats.archive_payload_bytes += info.size
+                        _drain(stream.extractfile(info), stats)
+                    continue
+                if not name:
+                    if info.isreg():
+                        stats.archive_payload_bytes += info.size
+                        _drain(stream.extractfile(info), stats)
+                    continue
+                kind = _member_kind(info)
+                if name in members:
+                    existing = members[name]
+                    # Duplicate directory entries occur in real archives (e.g. an
+                    # explicit "dir/" plus an implicit one); treat them as one.
+                    if kind == DIR and existing.kind == DIR:
+                        continue
+                    raise MalformedArchive(f"duplicate archive member {name!r}")
 
-            if kind == FILE:
-                stats.archive_payload_bytes += info.size
+                linkname = None
+                invalid_link = None
+                if kind == HARDLINK:
+                    try:
+                        linkname = normalize_member_name(info.linkname or "")
+                        if not linkname:
+                            invalid_link = "empty target"
+                    except MalformedArchive as exc:
+                        invalid_link = str(exc)
+                    if invalid_link and _within(name, selection):
+                        # A link we must reproduce cannot be trusted; fail loudly.
+                        raise LinkError(f"hard link {name!r}: {invalid_link}")
+                member = Member(
+                    name=name,
+                    kind=kind,
+                    size=info.size if kind == FILE else 0,
+                    mode=info.mode,
+                    mtime=info.mtime,
+                    linkname=linkname,
+                )
+                members[name] = member
 
-            inside = _within(name, selection)
-            if name == selection:
-                selection_member = member
-            if name.startswith(selection + "/"):
-                has_descendants = True
+                if kind == FILE:
+                    stats.archive_payload_bytes += info.size
 
-            if kind == FILE:
-                if inside and name != selection:
-                    rel = _rel(name, selection)
-                    tree.ensure_parents(rel)
-                    tree.register_file(rel)
-                    reader = stream.extractfile(info)
-                    if reader is None:
-                        raise MalformedArchive(f"cannot read payload of {name!r}")
-                    _write_payload(reader, tree.dest(rel), member, stats, fsync)
-                    selected_files.add(name)
-                    stats.files += 1
-                else:
-                    _drain(stream.extractfile(info), stats)
-            elif kind == DIR:
-                if inside and name != selection:
-                    rel = _rel(name, selection)
-                    tree.ensure_dir(rel, mode=member.mode, mtime=member.mtime)
-            elif kind == HARDLINK:
-                if inside and name != selection:
-                    rel = _rel(name, selection)
-                    tree.ensure_parents(rel)
-                    tree.register_file(rel)
-                    selected_links.append(name)
-                    stats.hardlinks += 1
-            elif inside and name != selection:
-                # Symlinks, devices, fifos: out of scope, never materialised, so
-                # they cannot be used to escape the staging tree.
-                stats.skipped_unsupported += 1
+                inside = _within(name, selection)
+                if name == selection:
+                    selection_member = member
+                if name.startswith(selection + "/"):
+                    has_descendants = True
+
+                if kind == FILE:
+                    if inside and name != selection:
+                        rel = _rel(name, selection)
+                        tree.ensure_parents(rel)
+                        tree.register_file(rel)
+                        reader = stream.extractfile(info)
+                        if reader is None:
+                            raise MalformedArchive(f"cannot read payload of {name!r}")
+                        _write_payload(reader, tree.dest(rel), member, stats, fsync)
+                        selected_files.add(name)
+                        stats.files += 1
+                    else:
+                        _drain(stream.extractfile(info), stats)
+                elif kind == DIR:
+                    if inside and name != selection:
+                        rel = _rel(name, selection)
+                        tree.ensure_dir(rel, mode=member.mode, mtime=member.mtime)
+                elif kind == HARDLINK:
+                    if inside and name != selection:
+                        rel = _rel(name, selection)
+                        tree.ensure_parents(rel)
+                        tree.register_file(rel)
+                        selected_links.append(name)
+                        stats.hardlinks += 1
+                elif inside and name != selection:
+                    # Symlinks, devices, fifos: out of scope, never materialised, so
+                    # they cannot be used to escape the staging tree.
+                    stats.skipped_unsupported += 1
+
+        # The selected directory may have ended early in the archive; the rest
+        # of the gzip stream (including its trailer) is still read and checked.
+        gz_reader.finish()
+        full_decompressed = gz_reader.decompressed
+    finally:
+        gz_reader.close()
 
     if selection_member is not None and selection_member.kind != DIR:
         raise NotADirectory(
@@ -476,7 +564,7 @@ def _populate(
             plan.external[source] = _rel(canonical, selection)
 
     if plan.external:
-        _fetch_external(archive_path, members, plan, tree, stats, fsync)
+        _fetch_external(archive_file, members, plan, tree, stats, fsync)
 
     # Create the hard links only after every payload exists, so forward and
     # chained references are all resolvable.
@@ -496,6 +584,14 @@ def _populate(
     tree.finalize_dirs(fsync)
     stats.directories = len(tree.dir_paths)
 
+    # Budget: the first pass proved the whole stream (full_decompressed); the
+    # optional second pass is a prefix of it.  The cumulative decompressed
+    # volume therefore never exceeds a complete decompression twice.
+    if stats.bytes_decompressed > 2 * full_decompressed:
+        raise RestoreError(
+            "internal error: decompression budget exceeded "
+            f"({stats.bytes_decompressed} > 2 x {full_decompressed})"
+        )
     if stats.bytes_extracted > 2 * stats.archive_payload_bytes:
         raise RestoreError(
             "internal error: extracted byte budget exceeded "
@@ -505,40 +601,50 @@ def _populate(
 
 
 def _fetch_external(
-    archive_path: str,
+    archive_file: BinaryIO,
     members: dict[str, Member],
     plan: _Plan,
     tree: _OutputTree,
     stats: RestoreResult,
     fsync: bool,
 ) -> None:
-    """Second pass: copy link targets that live outside the selection."""
+    """Second pass: copy link targets that live outside the selection.
+
+    This pass may stop as soon as every needed payload has been read: the
+    first pass already consumed and validated the whole gzip stream, so the
+    tail does not need to be re-checked here.
+    """
 
     remaining = set(plan.external)
     if not remaining:
         return
-    stream = _open_stream(archive_path)
-    with stream:
-        for info in stream:
-            if not info.isreg():
-                continue
-            try:
-                name = normalize_member_name(info.name)
-            except MalformedArchive:
-                _drain(stream.extractfile(info), stats)
-                continue
-            if name in remaining:
-                canonical_rel = plan.external[name]
-                tree.ensure_parents(canonical_rel)
-                reader = stream.extractfile(info)
-                if reader is None:
-                    raise MalformedArchive(f"cannot read payload of {name!r}")
-                _write_payload(reader, tree.dest(canonical_rel), members[name], stats, fsync)
-                remaining.remove(name)
-                if not remaining:
-                    break
-            else:
-                _drain(stream.extractfile(info), stats)
+    stream, gz_reader = _open_stream(archive_file, stats)
+    try:
+        with stream:
+            for info in stream:
+                if not info.isreg():
+                    continue
+                try:
+                    name = normalize_member_name(info.name)
+                except MalformedArchive:
+                    _drain(stream.extractfile(info), stats)
+                    continue
+                if name in remaining:
+                    canonical_rel = plan.external[name]
+                    tree.ensure_parents(canonical_rel)
+                    reader = stream.extractfile(info)
+                    if reader is None:
+                        raise MalformedArchive(f"cannot read payload of {name!r}")
+                    _write_payload(
+                        reader, tree.dest(canonical_rel), members[name], stats, fsync
+                    )
+                    remaining.remove(name)
+                    if not remaining:
+                        break
+                else:
+                    _drain(stream.extractfile(info), stats)
+    finally:
+        gz_reader.close()
     if remaining:
         raise LinkError(
             "hard link target(s) could not be located during the data pass: "
@@ -600,11 +706,27 @@ def restore_directory(
     try:
         os.makedirs(token_dir, mode=0o700)
         os.mkdir(output_root, 0o700)
+        # Open the archive once per attempt and keep that file description for
+        # every pass.  If the path is atomically replaced while this restore is
+        # running, the subsequent passes still read the backup we opened first;
+        # a request that opens afterwards sees the new file.  Mixing old and
+        # new data in one result is therefore impossible.
         try:
-            _populate(archive_path, selection, output_root, stats, fsync)
-        except (tarfile.TarError, EOFError, zlib.error) as exc:
-            raise InvalidArchive(f"corrupt or truncated archive: {exc}") from exc
-        stats.restored_path = _publish(token_dir, restore_root, restore_id, basename, fsync)
+            archive_file = open(archive_path, "rb")
+        except FileNotFoundError as exc:
+            raise PathNotFound(f"archive {archive_path!r} disappeared") from exc
+        except OSError as exc:
+            raise RestoreError(f"cannot open archive {archive_path!r}: {exc}") from exc
+        try:
+            try:
+                _populate(archive_file, selection, output_root, stats, fsync)
+            except (tarfile.TarError, EOFError, zlib.error) as exc:
+                raise InvalidArchive(f"corrupt or truncated archive: {exc}") from exc
+            stats.restored_path = _publish(
+                token_dir, restore_root, restore_id, basename, fsync
+            )
+        finally:
+            archive_file.close()
     except BaseException:
         _cleanup(
             [

@@ -60,6 +60,7 @@ class RestoreResponse(BaseModel):
     hardlinks: int
     bytes_written: int
     bytes_extracted: int
+    bytes_decompressed: int
     archive_payload_bytes: int
     skipped_unsafe: int
     skipped_unsupported: int

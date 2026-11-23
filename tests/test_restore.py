@@ -321,6 +321,13 @@ def test_extracted_bytes_stay_within_two_times_budget(tmp_path, archive_builder)
     result = restore_directory(archive, "d/sub", str(tmp_path / "out"), fsync=False)
     assert result.bytes_extracted <= 2 * result.archive_payload_bytes
     assert result.bytes_written == 5_000
+    # One complete decompression = the decompressed tar stream.  The first pass
+    # reads all of it (validating the tail); the second re-reads only a prefix.
+    import gzip
+
+    with open(archive, "rb") as fh:
+        one_pass = len(gzip.decompress(fh.read()))
+    assert one_pass <= result.bytes_decompressed <= 2 * one_pass
 
 
 def test_corrupt_archive_is_rejected(tmp_path):
@@ -429,3 +436,211 @@ def test_self_link_is_a_cycle(tmp_path, archive_builder):
     )
     with pytest.raises(LinkError, match="cycl"):
         restore_directory(archive, "d/sub", str(tmp_path / "out"), fsync=False)
+
+
+# --- gzip stream integrity -------------------------------------------------
+
+
+def _raw_tar(archive_builder, tmp_path, members=None) -> bytes:
+    """Return the decompressed tar bytes of a freshly built archive."""
+
+    import gzip
+
+    if members is None:
+        members = [
+            ("dir", "d"),
+            ("dir", "d/sub"),
+            ("file", "d/sub/early.txt", b"early"),
+            ("file", "ext/outside.bin", b"OUTSIDE" * 1000),
+            ("link", "d/sub/link", "ext/outside.bin"),
+            ("file", "d/sub/late.txt", b"late"),
+        ]
+    path = archive_builder("raw.tar.gz", members)
+    with open(path, "rb") as fh:
+        return gzip.decompress(fh.read())
+
+
+def _write_gzip(path, raw: bytes, cuts=()) -> str:
+    """Write ``raw`` as a gzip stream split into members at ``cuts``."""
+
+    import gzip
+
+    bounds = [0, *sorted(cuts), len(raw)]
+    with open(path, "wb") as fh:
+        for start, stop in zip(bounds, bounds[1:]):
+            fh.write(gzip.compress(raw[start:stop], mtime=0))
+    return str(path)
+
+
+def test_multimember_gzip_is_restored(tmp_path, archive_builder):
+    raw = _raw_tar(archive_builder, tmp_path)
+    archive = _write_gzip(
+        tmp_path / "multi.tar.gz", raw, cuts=[1000, 5000, len(raw) - 100]
+    )
+    result = restore_directory(archive, "d/sub", str(tmp_path / "out"), fsync=False)
+
+    assert result.files == 2  # early.txt, late.txt
+    assert result.hardlinks == 1
+    with open(os.path.join(result.restored_path, "late.txt"), "rb") as fh:
+        assert fh.read() == b"late"
+    with open(os.path.join(result.restored_path, "link"), "rb") as fh:
+        assert fh.read() == b"OUTSIDE" * 1000
+    assert result.bytes_extracted <= 2 * result.archive_payload_bytes
+
+
+def test_selected_directory_read_early_still_validates_tail(tmp_path, archive_builder):
+    """The selected dir is complete but the gzip trailer is half missing."""
+
+    raw = _raw_tar(archive_builder, tmp_path)
+    archive = _write_gzip(tmp_path / "trunc.tar.gz", raw)
+    with open(archive, "rb") as fh:
+        data = fh.read()
+    with open(archive, "wb") as fh:
+        fh.write(data[:-4])  # keep 4 of the 8 trailer bytes
+
+    out = tmp_path / "out"
+    from app.restore import InvalidArchive
+
+    with pytest.raises(InvalidArchive):
+        restore_directory(archive, "d/sub", str(out), fsync=False)
+    _assert_no_leftovers(out)
+
+
+@pytest.mark.parametrize("field", ["crc", "isize"])
+def test_bad_member_checksum_is_rejected(tmp_path, archive_builder, field):
+    raw = _raw_tar(archive_builder, tmp_path)
+    archive = _write_gzip(tmp_path / "bad.tar.gz", raw)
+    with open(archive, "rb") as fh:
+        data = bytearray(fh.read())
+    # Trailer layout: CRC32 (4 bytes) then ISIZE (4 bytes) at the very end.
+    data[-8 if field == "crc" else -4] ^= 0xFF
+    with open(archive, "wb") as fh:
+        fh.write(data)
+
+    out = tmp_path / "out"
+    from app.restore import InvalidArchive
+
+    with pytest.raises(InvalidArchive):
+        restore_directory(archive, "d/sub", str(out), fsync=False)
+    _assert_no_leftovers(out)
+
+
+def test_corrupt_later_member_fails_even_if_selection_was_in_first(
+    tmp_path, archive_builder
+):
+    import gzip
+
+    raw = _raw_tar(archive_builder, tmp_path)
+    first, rest = raw[:3000], raw[3000:]
+    good = gzip.compress(first, mtime=0)
+    tail = bytearray(gzip.compress(rest, mtime=0))
+    tail[-8] ^= 0x01  # break the CRC32 of the *second* member
+    archive = tmp_path / "multi_bad.tar.gz"
+    archive.write_bytes(good + bytes(tail))
+
+    out = tmp_path / "out"
+    from app.restore import InvalidArchive
+
+    with pytest.raises(InvalidArchive):
+        restore_directory(str(archive), "d/sub", str(out), fsync=False)
+    _assert_no_leftovers(out)
+
+
+def test_every_gzip_member_is_checked(tmp_path, archive_builder):
+    """Cut the stream into many members; corrupting an interior one fails."""
+
+    import gzip
+
+    raw = _raw_tar(archive_builder, tmp_path)
+    chunks = [raw[i : i + 700] for i in range(0, len(raw), 700)]
+    archive = tmp_path / "many.tar.gz"
+    archive.write_bytes(b"".join(gzip.compress(c, mtime=0) for c in chunks))
+
+    result = restore_directory(str(archive), "d/sub", str(tmp_path / "out"), fsync=False)
+    assert result.files == 2
+
+    broken = bytearray(archive.read_bytes())
+    second_start = len(gzip.compress(chunks[0], mtime=0))
+    broken[second_start + 3] ^= 0xFF
+    archive.write_bytes(bytes(broken))
+
+    out = tmp_path / "out2"
+    from app.restore import InvalidArchive
+
+    with pytest.raises(InvalidArchive):
+        restore_directory(str(archive), "d/sub", str(out), fsync=False)
+    _assert_no_leftovers(out)
+
+
+# --- archive rotation ------------------------------------------------------
+
+
+def _rotating_archive(path, payload: bytes) -> str:
+    """Archive whose selected dir holds a link to an *external* file.
+
+    The link forces a second read pass, so a test can rotate the archive
+    between the two passes.
+    """
+
+    import io
+    import tarfile
+
+    with tarfile.open(path, mode="w:gz", format=tarfile.GNU_FORMAT) as tar:
+        for name in ("d", "d/sub", "ext"):
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mtime = 1_700_000_000
+            tar.addfile(info)
+        info = tarfile.TarInfo("ext/data.bin")
+        info.size = len(payload)
+        info.mtime = 1_700_000_000
+        tar.addfile(info, io.BytesIO(payload))
+        link = tarfile.TarInfo("d/sub/data.txt")
+        link.type = tarfile.LNKTYPE
+        link.linkname = "ext/data.bin"
+        link.mtime = 1_700_000_000
+        tar.addfile(link)
+    return str(path)
+
+
+def test_restore_finishes_from_the_version_it_opened(tmp_path, monkeypatch):
+    """Rotating the path between passes must not mix new bytes into a result."""
+
+    import app.restore as restore_mod
+
+    old = _rotating_archive(tmp_path / "old.tar.gz", b"OLD-VERSION")
+    new = _rotating_archive(tmp_path / "new.tar.gz", b"NEW-VERSION")
+    live = tmp_path / "live.tar.gz"
+    with open(old, "rb") as src, open(live, "wb") as dst:
+        dst.write(src.read())
+
+    real_open_stream = restore_mod._open_stream
+    calls = {"n": 0}
+
+    def rotating_open_stream(fileobj, stats=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            os.replace(new, live)  # atomic swap in the middle of the restore
+        return real_open_stream(fileobj, stats)
+
+    monkeypatch.setattr(restore_mod, "_open_stream", rotating_open_stream)
+    result = restore_directory(str(live), "d/sub", str(tmp_path / "out"), fsync=False)
+
+    assert calls["n"] == 2
+    with open(os.path.join(result.restored_path, "data.txt"), "rb") as fh:
+        assert fh.read() == b"OLD-VERSION"
+
+
+def test_request_opened_after_rotation_sees_new_version(tmp_path):
+    live = tmp_path / "live.tar.gz"
+    replacement = _rotating_archive(tmp_path / "new.tar.gz", b"NEW-VERSION")
+    _rotating_archive(live, b"OLD-VERSION")
+
+    old_result = restore_directory(str(live), "d/sub", str(tmp_path / "out1"), fsync=False)
+    os.replace(replacement, live)
+    new_result = restore_directory(str(live), "d/sub", str(tmp_path / "out2"), fsync=False)
+
+    with open(os.path.join(old_result.restored_path, "data.txt"), "rb") as fh:
+        assert fh.read() == b"OLD-VERSION"
+    with open(os.path.join(new_result.restored_path, "data.txt"), "rb") as fh:
+        assert fh.read() == b"NEW-VERSION"

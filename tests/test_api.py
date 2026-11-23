@@ -114,6 +114,53 @@ def test_restore_invalid_selection(client):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("damage", ["truncated", "bad-crc", "bad-isize"])
+def test_restore_rejects_damaged_gzip_tail(client, damage):
+    """A damaged gzip tail must fail even though the selection reads cleanly."""
+
+    c, archives, restored = client
+    name = _make_archive(archives, "damaged.tar.gz")
+    path = archives / name
+    data = bytearray(path.read_bytes())
+    if damage == "truncated":
+        data = data[:-5]
+    elif damage == "bad-crc":
+        data[-8] ^= 0xFF
+    else:
+        data[-4] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+    response = c.post("/api/restores", json={"archive": name, "path": "data/2024"})
+    assert response.status_code == 400, response.text
+    # Nothing was published and no staging was left behind.
+    assert not os.path.isdir(restored) or [
+        p for p in os.listdir(restored) if not p.startswith(".")
+    ] == []
+    staging = restored / ".staging"
+    assert not staging.exists() or os.listdir(staging) == []
+
+
+def test_restore_multimember_gzip_via_api(client):
+    import gzip
+
+    c, archives, _r = client
+    raw = gzip.decompress((archives / _make_archive(archives, "source.tar.gz")).read_bytes())
+    cuts = [0, 2000, 6000, 9000, len(raw)]
+    multi = b"".join(
+        gzip.compress(raw[a:b], mtime=0) for a, b in zip(cuts, cuts[1:])
+    )
+    (archives / "multi.tar.gz").write_bytes(multi)
+
+    response = c.post("/api/restores", json={"archive": "multi.tar.gz", "path": "data/2024"})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["files"] >= 3
+    restored_path = body["restored_path"]
+    a = os.stat(os.path.join(restored_path, "shared_link")).st_ino
+    b = os.stat(os.path.join(restored_path, "chained_link")).st_ino
+    assert a == b
+
+
 def test_concurrent_restores_get_separate_directories(client):
     import threading
 
